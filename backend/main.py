@@ -1,6 +1,5 @@
 
 import os
-import json
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
@@ -32,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="GoML Flash Sale API",
     description="Concurrency-safe flash-sale checkout system",
-    version="1.1.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -112,7 +111,7 @@ async def checkout(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Serialize requests sharing the same idempotency key.
+            # Serialize requests that use the same idempotency key.
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 idempotency_key,
@@ -132,7 +131,7 @@ async def checkout(
                 order["replayed"] = True
                 return order
 
-            # Atomically reserve stock. It cannot fall below zero.
+            # Atomically reserve one unit; stock cannot go below zero.
             updated = await conn.fetchrow(
                 """
                 UPDATE inventory
@@ -144,46 +143,26 @@ async def checkout(
             )
 
             if not updated:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Sold out",
-                )
+                raise HTTPException(status_code=409, detail="Sold out")
 
             order_id = uuid4()
 
-            # Persist the pending order and event in one transaction.
+            # Confirm synchronously in the same transaction.
             await conn.execute(
                 """
                 INSERT INTO orders
                     (id, idempotency_key, product_id, status)
-                VALUES ($1, $2, $3, 'pending')
+                VALUES ($1, $2, $3, 'confirmed')
                 """,
                 order_id,
                 idempotency_key,
                 PRODUCT_ID,
             )
 
-            payload = json.dumps({
-                "event": "order.created",
-                "order_id": str(order_id),
-                "product_id": PRODUCT_ID,
-            })
-
-            await conn.execute(
-                """
-                INSERT INTO outbox
-                    (event_type, aggregate_id, payload)
-                VALUES ($1, $2, $3::jsonb)
-                """,
-                "order.created",
-                order_id,
-                payload,
-            )
-
             return {
                 "id": order_id,
                 "product_id": PRODUCT_ID,
-                "status": "pending",
+                "status": "confirmed",
                 "remaining_stock": updated["stock"],
                 "replayed": False,
             }
@@ -194,9 +173,6 @@ async def order_status(order_id: UUID):
     order = await get_order(app.state.db, order_id)
 
     if not order:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found",
-        )
+        raise HTTPException(status_code=404, detail="Order not found")
 
     return order
